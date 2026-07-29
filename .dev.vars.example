@@ -1,0 +1,4 @@
+# Local development only. Copy to `.dev.vars`; never commit real values.
+PASSWORD_PEPPER=replace-with-at-least-32-random-characters
+INITIAL_GUEST_PASSWORD=replace-with-a-strong-password
+SYNC_SECRET=replace-with-at-least-32-random-characters
