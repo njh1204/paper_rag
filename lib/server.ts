@@ -6,6 +6,15 @@ const SESSION_SECONDS = 60 * 60;
 const PBKDF2_ITERATIONS = 100_000;
 const LOGIN_WINDOW_MS = 10 * 60 * 1000;
 const MAX_LOGIN_FAILURES = 5;
+export const MAX_LOGIN_BODY_BYTES = 2_048;
+export const MAX_SYNC_BATCH_BYTES = 16 * 1024 * 1024;
+export const MAX_SYNC_BLOB_BYTES = 20 * 1024 * 1024;
+export const MAX_SYNC_CHECK_BYTES = 512 * 1024;
+export const MAX_SYNC_COMMIT_BYTES = 24 * 1024 * 1024;
+export const MAX_SNAPSHOT_BYTES = 512 * 1024 * 1024;
+export const MAX_SNAPSHOT_FILES = 5_000;
+
+let schemaReady: Promise<void> | undefined;
 
 export type RuntimeEnv = {
   DB: D1Database;
@@ -30,104 +39,84 @@ export function runtimeEnv(): RuntimeEnv {
 }
 
 export async function ensureSchema(db = runtimeEnv().DB) {
-  await db.batch([
-    db.prepare(
-      `CREATE TABLE IF NOT EXISTS vault_state (
-        id INTEGER PRIMARY KEY,
-        generation INTEGER NOT NULL DEFAULT 0,
-        updated_at TEXT NOT NULL
-      )`,
-    ),
-    db.prepare(
-      `CREATE TABLE IF NOT EXISTS vault_files (
-        generation INTEGER NOT NULL,
-        path TEXT NOT NULL,
-        hash TEXT NOT NULL,
-        size INTEGER NOT NULL,
-        mime TEXT NOT NULL,
-        mtime INTEGER NOT NULL,
-        search_text TEXT NOT NULL DEFAULT '',
-        listed INTEGER NOT NULL DEFAULT 1,
-        PRIMARY KEY (generation, path)
-      )`,
-    ),
-    db.prepare(
-      `CREATE TABLE IF NOT EXISTS vault_profiles (
-        generation INTEGER PRIMARY KEY,
-        json TEXT NOT NULL
-      )`,
-    ),
-    db.prepare(
-      `CREATE TABLE IF NOT EXISTS auth_state (
-        id INTEGER PRIMARY KEY,
-        password_salt TEXT NOT NULL,
-        password_hash TEXT NOT NULL,
-        iterations INTEGER NOT NULL,
-        session_epoch INTEGER NOT NULL DEFAULT 1,
-        updated_at TEXT NOT NULL
-      )`,
-    ),
-    db.prepare(
-      `CREATE TABLE IF NOT EXISTS login_attempts (
-        fingerprint TEXT PRIMARY KEY,
-        window_started_at INTEGER NOT NULL,
-        failures INTEGER NOT NULL,
-        blocked_until INTEGER NOT NULL DEFAULT 0
-      )`,
-    ),
-    db.prepare(
-      `CREATE TABLE IF NOT EXISTS auth_sessions (
-        token_hash TEXT PRIMARY KEY,
-        created_at INTEGER NOT NULL,
-        expires_at INTEGER NOT NULL
-      )`,
-    ),
-    db.prepare(
-      `CREATE TABLE IF NOT EXISTS sync_nonces (
-        nonce TEXT PRIMARY KEY,
-        created_at INTEGER NOT NULL,
-        expires_at INTEGER NOT NULL
-      )`,
-    ),
-    db.prepare(
-      `CREATE TABLE IF NOT EXISTS blob_objects (
-        hash TEXT PRIMARY KEY,
-        size INTEGER NOT NULL,
-        mime TEXT NOT NULL,
-        created_at INTEGER NOT NULL
-      )`,
-    ),
-    db.prepare(
-      "CREATE INDEX IF NOT EXISTS vault_files_hash_idx ON vault_files (generation, hash)",
-    ),
-    db.prepare(
-      "CREATE INDEX IF NOT EXISTS vault_files_search_idx ON vault_files (generation, path)",
-    ),
-    db.prepare(
-      "CREATE INDEX IF NOT EXISTS auth_sessions_expiry_idx ON auth_sessions (expires_at)",
-    ),
-    db.prepare(
-      "CREATE INDEX IF NOT EXISTS sync_nonces_expiry_idx ON sync_nonces (expires_at)",
-    ),
-  ]);
-  await db
-    .prepare(
-      "INSERT OR IGNORE INTO vault_state (id, generation, updated_at) VALUES (1, 0, ?)",
-    )
-    .bind(new Date().toISOString())
-    .run();
-  const columns = await db
-    .prepare("PRAGMA table_info(vault_files)")
-    .all<{ name: string }>();
-  if (!columns.results.some((column: { name: string }) => column.name === "listed")) {
-    try {
-      await db
-        .prepare("ALTER TABLE vault_files ADD COLUMN listed INTEGER NOT NULL DEFAULT 1")
-        .run();
-    } catch (error) {
-      if (!String(error).toLowerCase().includes("duplicate column")) throw error;
+  // Wrangler migrations own the schema. Check once per isolate rather than
+  // issuing a batch of DDL statements on every authenticated read.
+  schemaReady ??= db
+    .prepare("SELECT id FROM vault_state WHERE id = 1")
+    .first()
+    .then((row) => {
+      if (!row) throw new Error("D1 schema is not initialized; apply migrations first");
+    });
+  await schemaReady;
+}
+
+export class RequestBodyTooLargeError extends Error {}
+
+export async function readBodyLimited(request: Request, maximumBytes: number): Promise<ArrayBuffer> {
+  const declared = request.headers.get("content-length");
+  if (declared !== null) {
+    const size = Number(declared);
+    if (!Number.isSafeInteger(size) || size < 0 || size > maximumBytes) {
+      throw new RequestBodyTooLargeError("Request body is too large");
     }
   }
+  if (!request.body) return new ArrayBuffer(0);
+
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maximumBytes) {
+      await reader.cancel();
+      throw new RequestBodyTooLargeError("Request body is too large");
+    }
+    chunks.push(value);
+  }
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return merged.buffer;
+}
+
+export async function readTextLimited(request: Request, maximumBytes: number): Promise<string> {
+  return new TextDecoder("utf-8", { fatal: true }).decode(
+    await readBodyLimited(request, maximumBytes),
+  );
+}
+
+const ALLOWED_SYNC_MIME = new Map([
+  ["application/json", "application/json; charset=utf-8"],
+  ["text/markdown", "text/markdown; charset=utf-8"],
+  ["image/jpeg", "image/jpeg"],
+  ["image/png", "image/png"],
+  ["image/webp", "image/webp"],
+  ["image/gif", "image/gif"],
+]);
+
+export function normalizeSyncMime(input: string): string | null {
+  return ALLOWED_SYNC_MIME.get(input.split(";", 1)[0].trim().toLowerCase()) ?? null;
+}
+
+export function isAllowedSnapshotPath(path: string, mime: string): boolean {
+  const json =
+    path === "library/tree.json" ||
+    /^(papers|annotations)\/[^/]+\.json$/.test(path) ||
+    /^citations\/[^/]+\/(ko|en)\.json$/.test(path) ||
+    /^children\/[^/]+\/[^/]+\.json$/.test(path);
+  if (json) return mime === "application/json; charset=utf-8";
+  if (/^content\/[^/]+\/(ko|en)\.md$/.test(path)) {
+    return mime === "text/markdown; charset=utf-8";
+  }
+  if (/^assets\/[^/]+\/.+\.(jpe?g|png|webp|gif)$/i.test(path)) {
+    return /^image\/(jpeg|png|webp|gif)$/.test(mime);
+  }
+  return false;
 }
 
 export function normalizeVaultPath(input: string): string {
@@ -405,6 +394,14 @@ export async function recordLoginFailure(
     )
     .bind(fingerprint, windowStartedAt, failures, blockedUntil)
     .run();
+  // Roughly 1/256 failure records perform bounded retention cleanup, avoiding
+  // an extra write on every failed login while preventing unbounded bot rows.
+  if (fingerprint.startsWith("00")) {
+    await runtimeEnv().DB
+      .prepare("DELETE FROM login_attempts WHERE window_started_at < ?")
+      .bind(now - 24 * 60 * 60 * 1000)
+      .run();
+  }
 }
 
 export async function clearLoginFailures(fingerprint: string) {
@@ -452,6 +449,21 @@ export async function verifySyncRequest(
   if (!inserted.meta.changes) return false;
   await db.prepare("DELETE FROM sync_nonces WHERE expires_at <= ?").bind(now).run();
   return true;
+}
+
+export function hasValidSyncEnvelope(request: Request): boolean {
+  const timestamp = request.headers.get("x-sync-timestamp");
+  const nonce = request.headers.get("x-sync-nonce");
+  const signature = request.headers.get("x-sync-signature");
+  return Boolean(
+    timestamp &&
+      nonce &&
+      signature &&
+      /^\d+$/.test(timestamp) &&
+      /^[a-f0-9]{32}$/.test(nonce) &&
+      /^[a-f0-9]{64}$/.test(signature) &&
+      Math.abs(Date.now() - Number(timestamp)) <= 5 * 60 * 1000,
+  );
 }
 
 export function clearSessionCookie(): string {

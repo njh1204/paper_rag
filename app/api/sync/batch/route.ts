@@ -1,12 +1,16 @@
 import {
   ensureSchema,
+  hasValidSyncEnvelope,
+  MAX_SYNC_BATCH_BYTES,
+  normalizeSyncMime,
   privateHeaders,
+  readTextLimited,
+  RequestBodyTooLargeError,
   runtimeEnv,
   sha256Hex,
   verifySyncRequest,
 } from "@/lib/server";
 
-const MAX_REQUEST_BYTES = 16 * 1024 * 1024;
 const MAX_ITEMS = 200;
 
 type BatchItem = {
@@ -21,9 +25,17 @@ function decodeBase64(value: string): Uint8Array {
 }
 
 export async function POST(request: Request) {
-  const body = await request.text();
-  if (new TextEncoder().encode(body).byteLength > MAX_REQUEST_BYTES) {
-    return Response.json({ error: "Batch exceeds 16 MB" }, { status: 413, headers: privateHeaders() });
+  if (!hasValidSyncEnvelope(request)) {
+    return Response.json({ error: "Invalid sync envelope" }, { status: 401, headers: privateHeaders() });
+  }
+  let body: string;
+  try {
+    body = await readTextLimited(request, MAX_SYNC_BATCH_BYTES);
+  } catch (error) {
+    if (error instanceof RequestBodyTooLargeError) {
+      return Response.json({ error: "Batch exceeds 16 MB" }, { status: 413, headers: privateHeaders() });
+    }
+    return Response.json({ error: "Invalid UTF-8 body" }, { status: 400, headers: privateHeaders() });
   }
   if (!(await verifySyncRequest(request, body))) {
     return Response.json({ error: "Invalid sync signature" }, { status: 401, headers: privateHeaders() });
@@ -44,9 +56,11 @@ export async function POST(request: Request) {
       if (!/^[a-f0-9]{64}$/.test(hash)) throw new Error("Invalid hash");
       const bytes = decodeBase64(String(item.data || ""));
       if ((await sha256Hex(bytes.buffer as ArrayBuffer)) !== hash) throw new Error("Hash mismatch");
+      const mime = normalizeSyncMime(String(item.mime || ""));
+      if (!mime) throw new Error("Unsupported content type");
       decoded.push({
         hash,
-        mime: String(item.mime || "application/octet-stream").slice(0, 120),
+        mime,
         bytes,
       });
     }

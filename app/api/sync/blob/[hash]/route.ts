@@ -1,12 +1,15 @@
 import {
   ensureSchema,
+  hasValidSyncEnvelope,
+  MAX_SYNC_BLOB_BYTES,
+  normalizeSyncMime,
   privateHeaders,
+  readBodyLimited,
+  RequestBodyTooLargeError,
   runtimeEnv,
   sha256Hex,
   verifySyncRequest,
 } from "@/lib/server";
-
-const MAX_BLOB_BYTES = 20 * 1024 * 1024;
 
 export async function PUT(
   request: Request,
@@ -16,9 +19,21 @@ export async function PUT(
   if (!/^[a-f0-9]{64}$/.test(hash)) {
     return Response.json({ error: "Invalid hash" }, { status: 400, headers: privateHeaders() });
   }
-  const body = await request.arrayBuffer();
-  if (body.byteLength > MAX_BLOB_BYTES) {
-    return Response.json({ error: "Blob exceeds 20 MB" }, { status: 413, headers: privateHeaders() });
+  if (!hasValidSyncEnvelope(request)) {
+    return Response.json({ error: "Invalid sync envelope" }, { status: 401, headers: privateHeaders() });
+  }
+  const mime = normalizeSyncMime(request.headers.get("content-type") ?? "");
+  if (!mime) {
+    return Response.json({ error: "Unsupported content type" }, { status: 415, headers: privateHeaders() });
+  }
+  let body: ArrayBuffer;
+  try {
+    body = await readBodyLimited(request, MAX_SYNC_BLOB_BYTES);
+  } catch (error) {
+    if (error instanceof RequestBodyTooLargeError) {
+      return Response.json({ error: "Blob exceeds 20 MB" }, { status: 413, headers: privateHeaders() });
+    }
+    throw error;
   }
   if (!(await verifySyncRequest(request, body))) {
     return Response.json({ error: "Invalid sync signature" }, { status: 401, headers: privateHeaders() });
@@ -27,7 +42,7 @@ export async function PUT(
     return Response.json({ error: "Hash mismatch" }, { status: 400, headers: privateHeaders() });
   }
   await runtimeEnv().VAULT.put(`blobs/${hash}`, body, {
-    httpMetadata: { contentType: request.headers.get("content-type") ?? "application/octet-stream" },
+    httpMetadata: { contentType: mime },
   });
   await ensureSchema();
   await runtimeEnv().DB
@@ -41,7 +56,7 @@ export async function PUT(
     .bind(
       hash,
       body.byteLength,
-      request.headers.get("content-type") ?? "application/octet-stream",
+      mime,
       Date.now(),
     )
     .run();

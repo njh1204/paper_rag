@@ -2,39 +2,41 @@ import {
   checkLoginLimit,
   clearLoginFailures,
   issueSessionCookie,
+  MAX_LOGIN_BODY_BYTES,
   privateHeaders,
+  readTextLimited,
+  RequestBodyTooLargeError,
   recordLoginFailure,
   verifyPassword,
 } from "@/lib/server";
 
-const MAX_LOGIN_BODY_BYTES = 2_048;
 const MAX_PASSWORD_CHARACTERS = 256;
 
 export async function POST(request: Request) {
-  const contentLength = Number(request.headers.get("content-length") || 0);
-  if (contentLength > MAX_LOGIN_BODY_BYTES) {
-    return Response.json(
-      { error: "요청 크기가 너무 큽니다." },
-      { status: 413, headers: privateHeaders() },
-    );
-  }
-
   const limit = await checkLoginLimit(request);
   if (limit.blocked) {
     return Response.json(
-      { error: "로그인 시도가 너무 많습니다. 10분 뒤 다시 시도해 주세요." },
+      { error: "로그인 시도가 너무 많습니다. 10분 후 다시 시도해 주세요." },
       { status: 429, headers: privateHeaders({ "Retry-After": "600" }) },
     );
   }
 
   let password = "";
   try {
-    const payload = (await request.json()) as { password?: unknown };
+    const payload = JSON.parse(
+      await readTextLimited(request, MAX_LOGIN_BODY_BYTES),
+    ) as { password?: unknown };
     password = typeof payload.password === "string" ? payload.password : "";
     if (!password || password.length > MAX_PASSWORD_CHARACTERS) {
       throw new Error("Invalid password");
     }
-  } catch {
+  } catch (error) {
+    if (error instanceof RequestBodyTooLargeError) {
+      return Response.json(
+        { error: "요청 크기가 너무 큽니다." },
+        { status: 413, headers: privateHeaders() },
+      );
+    }
     return Response.json(
       { error: "올바른 요청이 아닙니다." },
       { status: 400, headers: privateHeaders() },

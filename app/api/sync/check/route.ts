@@ -1,7 +1,27 @@
-import { ensureSchema, privateHeaders, runtimeEnv, verifySyncRequest } from "@/lib/server";
+import {
+  ensureSchema,
+  hasValidSyncEnvelope,
+  MAX_SYNC_CHECK_BYTES,
+  privateHeaders,
+  readTextLimited,
+  RequestBodyTooLargeError,
+  runtimeEnv,
+  verifySyncRequest,
+} from "@/lib/server";
 
 export async function POST(request: Request) {
-  const body = await request.text();
+  if (!hasValidSyncEnvelope(request)) {
+    return Response.json({ error: "Invalid sync envelope" }, { status: 401, headers: privateHeaders() });
+  }
+  let body: string;
+  try {
+    body = await readTextLimited(request, MAX_SYNC_CHECK_BYTES);
+  } catch (error) {
+    if (error instanceof RequestBodyTooLargeError) {
+      return Response.json({ error: "Hash list is too large" }, { status: 413, headers: privateHeaders() });
+    }
+    return Response.json({ error: "Invalid UTF-8 body" }, { status: 400, headers: privateHeaders() });
+  }
   if (!(await verifySyncRequest(request, body))) {
     return Response.json({ error: "Invalid sync signature" }, { status: 401, headers: privateHeaders() });
   }

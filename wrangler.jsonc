@@ -25,8 +25,34 @@
       "bucket_name": "paper-rag-vault"
     }
   ],
+  "ratelimits": [
+    {
+      "name": "LOGIN_RATE_LIMITER",
+      "namespace_id": "120401",
+      "simple": {
+        "limit": 8,
+        "period": 60
+      }
+    },
+    {
+      "name": "READ_RATE_LIMITER",
+      "namespace_id": "120402",
+      "simple": {
+        "limit": 300,
+        "period": 60
+      }
+    },
+    {
+      "name": "SYNC_RATE_LIMITER",
+      "namespace_id": "120403",
+      "simple": {
+        "limit": 120,
+        "period": 60
+      }
+    }
+  ],
   "observability": {
     "enabled": true,
-    "head_sampling_rate": 0.1
+    "head_sampling_rate": 0.01
   }
 }

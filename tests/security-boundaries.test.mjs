@@ -71,3 +71,29 @@ test("does not expose mutation routes in the hosted read API", async () => {
   assert.doesNotMatch(route, /export async function (POST|PUT|PATCH|DELETE)/);
   assert.doesNotMatch(readerApi, /uploadParent|promote:|retryJob|deleteHighlight|highlight:\s*\(/);
 });
+
+test("caps denial-of-wallet paths before they reach D1 or R2", async () => {
+  const [worker, server, blob, batch, check, commit, wrangler] = await Promise.all([
+    readFile(path.join(root, "worker/index.ts"), "utf8"),
+    readFile(path.join(root, "lib/server.ts"), "utf8"),
+    readFile(path.join(root, "app/api/sync/blob/[hash]/route.ts"), "utf8"),
+    readFile(path.join(root, "app/api/sync/batch/route.ts"), "utf8"),
+    readFile(path.join(root, "app/api/sync/check/route.ts"), "utf8"),
+    readFile(path.join(root, "app/api/sync/commit/route.ts"), "utf8"),
+    readFile(path.join(root, "wrangler.jsonc"), "utf8"),
+  ]);
+
+  assert.match(worker, /LOGIN_RATE_LIMITER/);
+  assert.match(worker, /READ_RATE_LIMITER/);
+  assert.match(worker, /SYNC_RATE_LIMITER/);
+  assert.match(worker, /syncEnvelopeLooksValid/);
+  assert.match(server, /readBodyLimited/);
+  assert.match(server, /MAX_SNAPSHOT_BYTES/);
+  assert.match(server, /isAllowedSnapshotPath/);
+  assert.doesNotMatch(server, /CREATE TABLE IF NOT EXISTS/);
+  assert.match(`${blob}\n${batch}\n${check}\n${commit}`, /RequestBodyTooLargeError/);
+  assert.match(commit, /new Set\(files\.map/);
+  assert.match(commit, /MAX_SNAPSHOT_BYTES/);
+  assert.doesNotMatch(wrangler, /"cpu_ms"/);
+  assert.match(wrangler, /"head_sampling_rate": 0\.01/);
+});

@@ -1,7 +1,16 @@
 import {
   ensureSchema,
+  hasValidSyncEnvelope,
+  isAllowedSnapshotPath,
+  MAX_SNAPSHOT_BYTES,
+  MAX_SNAPSHOT_FILES,
+  MAX_SYNC_BLOB_BYTES,
+  MAX_SYNC_COMMIT_BYTES,
   normalizeVaultPath,
+  normalizeSyncMime,
   privateHeaders,
+  readTextLimited,
+  RequestBodyTooLargeError,
   runtimeEnv,
   type VaultFileInput,
   verifySyncRequest,
@@ -13,7 +22,18 @@ type CommitPayload = {
 };
 
 export async function POST(request: Request) {
-  const body = await request.text();
+  if (!hasValidSyncEnvelope(request)) {
+    return Response.json({ error: "Invalid sync envelope" }, { status: 401, headers: privateHeaders() });
+  }
+  let body: string;
+  try {
+    body = await readTextLimited(request, MAX_SYNC_COMMIT_BYTES);
+  } catch (error) {
+    if (error instanceof RequestBodyTooLargeError) {
+      return Response.json({ error: "Manifest is too large" }, { status: 413, headers: privateHeaders() });
+    }
+    return Response.json({ error: "Invalid UTF-8 body" }, { status: 400, headers: privateHeaders() });
+  }
   if (!(await verifySyncRequest(request, body))) {
     return Response.json(
       { error: "Invalid sync signature" },
@@ -30,7 +50,7 @@ export async function POST(request: Request) {
       { status: 400, headers: privateHeaders() },
     );
   }
-  if (!Array.isArray(payload.files) || payload.files.length > 5_000) {
+  if (!Array.isArray(payload.files) || payload.files.length > MAX_SNAPSHOT_FILES) {
     return Response.json(
       { error: "A full manifest of up to 5,000 files is required" },
       { status: 400, headers: privateHeaders() },
@@ -43,7 +63,7 @@ export async function POST(request: Request) {
       path: normalizeVaultPath(file.path),
       hash: file.hash.toLowerCase(),
       size: Number(file.size),
-      mime: String(file.mime || "application/octet-stream").slice(0, 120),
+      mime: normalizeSyncMime(String(file.mime || "")) ?? "",
       mtime: Number(file.mtime),
       searchText: String(file.searchText ?? "").slice(0, 150_000),
       listed: file.listed !== false,
@@ -52,8 +72,10 @@ export async function POST(request: Request) {
       files.some(
         (file) =>
           !/^[a-f0-9]{64}$/.test(file.hash) ||
+          !isAllowedSnapshotPath(file.path, file.mime) ||
           !Number.isFinite(file.size) ||
           file.size < 0 ||
+          file.size > MAX_SYNC_BLOB_BYTES ||
           !Number.isFinite(file.mtime),
       )
     ) {
@@ -63,6 +85,16 @@ export async function POST(request: Request) {
     return Response.json(
       { error: "Invalid manifest entry" },
       { status: 400, headers: privateHeaders() },
+    );
+  }
+  if (
+    new Set(files.map((file) => file.path)).size !== files.length ||
+    files.reduce((total, file) => total + file.size, 0) > MAX_SNAPSHOT_BYTES ||
+    JSON.stringify(payload.profile ?? {}).length > 1_000_000
+  ) {
+    return Response.json(
+      { error: "Snapshot limits exceeded" },
+      { status: 413, headers: privateHeaders() },
     );
   }
 
