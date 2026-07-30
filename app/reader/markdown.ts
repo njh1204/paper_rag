@@ -10,7 +10,9 @@ const plainHeadingText = (value: string) =>
   value
     .replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1")
     .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
-    .replace(/<[^>]+>/g, "")
+    // Remove the delimiter characters themselves. Replacing whole HTML-like
+    // sequences once can expose a nested tag after the replacement.
+    .replace(/[<>]/g, "")
     .replace(/[*_~`]/g, "")
     .trim();
 
